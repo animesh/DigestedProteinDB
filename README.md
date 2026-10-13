@@ -1,202 +1,188 @@
 # Digested Peptide Database
 
-## Overview
+Search enzymatically digested peptides by precursor mass, fragment ions, and species.
+Handles SwissProt to full TrEMBL scale. No Java, no server, no RocksDB.
 
-DigestedProteinDB is a database that enables researchers in the field of proteomics to search for enzymatically digested
-peptides by mass, sequence, and m/z values.
+## How it works
 
-A Java library for creating and searching a digested peptide database with RocksDB key-value store.
-Digested peptides are generated from protein sequences using a specific enzyme (e.g., trypsin) and are stored in a
-database for rapid mass-based searches. This library is designed to be a compact and efficient storage of
-in-silico digested peptides.
+Three Python scripts replace the original Java + RocksDB stack:
 
-The database is designed to be a compact and efficient storage of in-silico digested peptides. The primary goal is to
-support rapid mass-based searches, even on less powerful desktop machines.
+| File | What it does |
+|---|---|
+| `common.py` | Mass tables, trypsin/chymotrypsin digestion, b/y ion computation, fragment scoring |
+| `build_db.py` | Streams UniProt XML.gz, digests proteins, writes sorted Parquet chunks, merges into a single DuckDB file |
+| `search_mgf.py` | Parses MGF, fires a single batch range join against the DB, scores fragment ions, writes TSV |
 
-https://digestedproteindb.pbf.hr
+The database is a plain DuckDB file with two tables:
 
-This compact database layout enables fast peptide mass queries with minimal resource usage. For example, a Uniprot
-TrEMBL bacteria dataset (7 to 30 amino acids, 1 missed cleavage) occupies about 50 GB on disk and supports quick lookups
-by mass range on standard hardware.
+- `peptides(mass_int INT, seq TEXT, accid INT, taxid INT)` sorted by `mass_int`
+- `accessions(accid INT, acc TEXT, taxid INT)`
 
-For example, searching for masses from: `1500.6` Da to `1500.8` Da gives JSON ptmSearchResults like:
+`mass_int` is `round(neutral_monoisotopic_mass * 1e4)` so a 20 ppm window at 1500 Da is about 300 integer units wide. DuckDB's row-group statistics on the sorted column make range scans fast without a separate index.
 
-**acc** — Uniprot accession number
-**seq** - peptide sequence,
-**mass** - peptide mass.
-
-```json
-{
-  "totalResult": 1543,
-  "memory": "2016 MB",
-  "duration": "00:00:00.031",
-  "page": 1,
-  "pageSize": 10,
-  "result": [
-    {
-      "1500.6": [
-        {
-          "seq": "SSNESGSSGSMTNEK",
-          "acc": [
-            "A0A085MEL6"
-          ]
-        },
-        {
-          "seq": "CSGSTSESEGSQTNK",
-          "acc": [
-            "A0AAD6LB27",
-            "A0AAD6L9P6",
-            "A0A4U5R0T2",
-            "A0A8X8BWN4",
-            "A0A8X8C0W2"
-          ]
-        },
-        {
-          "seq": "NSCSASESQSDTGTK",
-          "acc": [
-            "A0A3P9Q6N9"
-          ]
-        },
-        {
-          "seq": "EDNSCSSSAGSTQTK",
-          "acc": [
-            "A0AAV4GC55"
-          ]
-        }
-      ]
-    },
-    {
-      "1500.6002": [
-        {
-          "seq": "VEIEYDDEDMMI",
-          "acc": [
-            "A0A1Y2LUM3"
-          ]
-        },
-        {
-          "seq": "CHGWGGSQCHHHR",
-          "acc": [
-            "A0A8B9NSG9"
-          ]
-        }
-      ]
-    },
-    ... 
-``` 
-
-## Key Features
-
-**Minimal and fast database**: Database of digested peptides designed for a small on\-disk footprint
-**Mass\-oriented search**: Stores peptide data keyed by mass to expedite lookups based on precise mass ranges
-
-## Library Integration
-
-This database is designed as a Java library that can be easily embedded into existing software applications.
-The library provides a clean API for programmatic access to peptide data, making it ideal for integration with mass
-spectrometry
-analysis tools or custom bioinformatics pipelines.
-
-## Installation
-
-The project can be built using Maven and Java 24.
-To build the project, navigate to the root directory of the project and run:
+## Install
 
 ```bash
-mvn clean package
+pip install duckdb pyarrow lxml
 ```
 
-This will create a JAR file in the `target` directory.
+Python 3.10+ required. No other dependencies.
 
-## Requirements
-
-- Java 24 or higher
-- Maven 3.8 or higher for building the project from source
-- Linux, MacOS for database building
-- Linux, MacOS, Windows for running the database search server
-
-## Command-Line Parameters
-
-The application provides two main commands: `create-db` for creating the database and `server` for running the web
-server. Below is a detailed explanation of the parameters for each command.
-
-### `create-db` Command
-
-This command is used to create a digested peptide database.
-The following table describes the available parameters:
-
-| Parameter                       | Description                                                                                            | Required | Default Value |
-|---------------------------------|--------------------------------------------------------------------------------------------------------|----------|---------------|
-| `-d`, `--db-dir`                | Path to the database directory.                                                                        | Yes      | None          |
-| `-u`, `--uniprot-xml`           | Path to the Uniprot XML file (`.xml.gz` or `.xml`).                                                    | Yes      | None          |
-| `-n`, `--db-name`               | Name of the database.                                                                                  | Yes      | None          |
-| `-c`, `--clean`                 | Clean all files in the database directory before creating.                                             | No       | `false`       |
-| `-m`, `--min-length`            | Minimum peptide length.                                                                                | No       | `7`           |
-| `-M`, `--max-length`            | Maximum peptide length.                                                                                | No       | `30`          |
-| `-mc`, `--missed-cleavage`      | Number of missed cleavages.                                                                            | No       | `1`           |
-| `-s`, `--sort-temp-dir`         | Path to the temporary directory used for sorting.                                                      | No       | None          |
-| `-ncbi`, `--ncbi-taxonomy-path` | Path to the NCBI taxonomy file (`nodes.dmp`). https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz | No       | None          |
-| `-p`, `--taxonomy-parents`      | NCBI Taxonomy parent (ancestor) IDs.                                                                   | No       | All           |
-| `-e`, `--enzyme`                | Enzyme used for digestion (e.g., Trypsin, Chymotrypsin).                                               | No       | `Trypsin`     |
-| `-t`, `--taxonomy-division`     | NCBI Taxonomy division to filter proteins (e.g., Bacteria, Viruses, etc.).                             | No       | `ALL`         |
-
-### Example Usage
-
-Run the compiled JAR with the create-db subcommand:
+## Build the database
 
 ```bash
-java -jar digestdb.jar create-db 
--d "path/to/db/dir" 
--u "path/to/uniprot/xml/file.xml.gz" 
--n myDatabaseName
--c 
--m 7 
--M 30 
--s path/to/sort/temp/dir 
--ncbi "path/to/ncbi/taxonomy/file" 
--p 10239 -p 33090 
--e Trypsin 
--t ALL
+python build_db.py ^
+    --fasta L:\promec\FastaDB\uniprot_trembl.fasta ^
+    --db C:\Users\animeshs\tmp\combined.duckdb ^
+    --tmp-dir C:\Users\animeshs\tmp ^
+    --memory 28GB --threads 12 --bands 20 ^
+    --log build.log --merge-only
+# TrEMBL bacteria only (~50 GB on disk, a few hours)
+python build_db.py \
+    --uniprot uniprot_trembl.xml.gz \
+    --db      trembl_bacteria.duckdb \
+    --taxid   2 \
+    --nodes   nodes.dmp \
+    --mc 1 --min 7 --max 30
+# TrEMBL viruses + plants
+python build_db.py \
+    --uniprot uniprot_trembl.xml.gz \
+    --db      trembl_vp.duckdb \
+    --taxid   10239 33090 \
+    --nodes   nodes.dmp
 ```
 
-### Run the Web Server
+NCBI taxonomy files (`nodes.dmp`, `names.dmp`) are in `taxdump.tar.gz` at
+`https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz`.
 
-Start a simple web server for searching:
+### Build parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--uniprot` | required | UniProt XML or XML.gz |
+| `--db` | required | Output DuckDB file |
+| `--enzyme` | `trypsin` | `trypsin` or `chymotrypsin` |
+| `--min` | `7` | Minimum peptide length |
+| `--max` | `30` | Maximum peptide length |
+| `--mc` | `1` | Max missed cleavages |
+| `--taxid` | all | Restrict to descendants of these NCBI taxids |
+| `--nodes` | none | `nodes.dmp` (required when `--taxid` is used) |
+
+Memory during build stays constant regardless of input size: proteins are streamed
+one at a time, peptide rows are written in Parquet chunks of 5 M rows, and
+DuckDB does the final merge-sort in one parallel pass.
+
+## Search an MGF file
 
 ```bash
-java -jar digestdb.jar server 
--p 8080 
--d "/path/to/db/dir"
+python search_mgf.py \
+    --db      trembl_bacteria.duckdb \
+    --mgf     sample.mgf \
+    --ppm     20 \
+    --ptms \
+    --taxid   1763 1760 \
+    --names   names.dmp \
+    --min-ions 3 \
+    --out     results.tsv
 ```
 
-Demonstration search web: https://digestedproteindb.pbf.hr
+### Search parameters
 
-## Create database steps
+| Parameter | Default | Description |
+|---|---|---|
+| `--db` | required | DuckDB file from `build_db.py` |
+| `--mgf` | required | Input MGF file |
+| `--ppm` | `20` | Precursor mass tolerance in ppm |
+| `--ptms` | off | Also search with common PTM mass offsets (see below) |
+| `--taxid` | all | Keep hits from these exact NCBI taxids only |
+| `--min-ions` | `3` | Min matched fragment ions to report a hit (only applied when MS2 is present) |
+| `--names` | none | `names.dmp` for a species name column in the output |
+| `--out` | stdout | Output TSV path |
 
-The database creation process starts with the uniprot.xml.gz (or .xml) file.
-Example class `hr.pbf.digestdb.CreateDatabase` is used to create the database.
+### PTM offsets
 
-The process consists of the following steps:
+When `--ptms` is set, each spectrum is searched against additional mass
+windows shifted by the following deltas. A hit from a PTM window is labelled
+accordingly in the output, and fragment scoring tries placing the modification
+on every applicable residue to localise the best position.
 
-1. **Parse Uniprot Data**: Extract sequences and relevant metadata from uniprot .xml.gz database and NCBI Taxonomy.
-2. **Digest Proteins**: Cleave the protein with a specific enzyme (trypsin, for example).
-3. **Organize Data**: Sort and group peptides by mass for easy storage.
-4. **Build Database**: Generate a mass\-indexed key\-value engine (RocksDB) and custom array list index for quick
-   searches.
+| Label | Delta (Da) | Residues |
+|---|---|---|
+| `ox_M` | +15.994915 | M |
+| `phospho` | +79.966331 | S, T, Y |
+| `deamid` | +0.984016 | N, Q |
+| `acetyl_K` | +42.010565 | K |
+| `carbam_C` | +57.021464 | C |
 
-Many optimizations are used to speed up the process, including:
+### Output columns
 
-- **Custom Data Structures**: Use specialized data structures for storing data. Sequences are stored as 5-bit encoded
-  strings, masses are stored as 4-byte integers, and accession numbers are 36-base encoded strings stored in 64-bit
-  data (long) and mapped to 4-byte integers.
+```
+scan_id  title  precursor_mass_da  charge  peptide_seq  accession  taxid  species
+ppm_err  ptm  ptm_pos  n_matched_ions  frag_score
+```
+
+- `ptm` is `none` for unmodified hits
+- `ptm_pos` is the 0-indexed position of the best-localised modification (`-1` if none)
+- `frag_score` is the fraction of total observed fragment intensity matched
+- `n_matched_ions` counts matched singly-charged b/y ions within the ppm tolerance
+
+## Species filtering
+
+`--taxid` in `search_mgf.py` takes exact NCBI taxids. For a whole clade
+(e.g. all Mycobacterium, taxid 1763), the most efficient approach is to filter
+at build time:
+
+```bash
+python build_db.py --uniprot trembl.xml.gz --db myco.duckdb \
+    --taxid 1763 --nodes nodes.dmp
+```
+
+If you already have a full-TrEMBL database and want to filter at query time,
+pass all descendant taxids to `--taxid`. You can generate them with:
+
+```python
+from build_db import load_ncbi_descendants
+taxids = load_ncbi_descendants('nodes.dmp', [1763])
+# pass as: --taxid 1763 <all descendants>
+```
+
+## Fragment ion scoring
+
+Scoring is straightforward: for each candidate peptide compute singly-charged
+b and y ions, count how many land within `--ppm` of an observed peak, and sum
+the matched intensities. `frag_score` is that sum divided by total spectrum
+intensity.
+
+For PTM candidates the scorer tries each possible modification site and reports
+the position with the most matched ions. Double modifications and multiply
+charged fragment ions are not handled; that level of scoring belongs in a
+dedicated engine like MSFragger or Mascot.
+
+## Known limitations
+
+- Fragment scoring covers z=1 b/y ions only.
+- Double modifications on the same peptide are not modelled.
+- Clade expansion at search time requires pre-computing descendants externally.
+- The DuckDB range join for very large MGF files (> 50k spectra) has not been
+  benchmarked at full TrEMBL scale yet. If it becomes a bottleneck, splitting
+  the MGF into chunks and running in parallel is the straightforward fix.
+
+## File sizes and timing (approximate)
+
+| Dataset | DB size | Build time | Search 1000 spectra |
+|---|---|---|---|
+| SwissProt (~570k proteins) | ~2 GB | ~10 min | < 5 s |
+| TrEMBL bacteria (~50M proteins) | ~50 GB | ~3 h | < 60 s |
+| Full TrEMBL | ~500 GB | ~24 h | < 10 min |
+
+Timings on a 16-core workstation with NVMe storage. Build is I/O and
+single-thread XML-parse bound. Search is DuckDB multicore.
 
 ## TODO
 
-- Python code for searching the database
-- Expand and improve documentation
-- Create more downloadable databases with different enzymes and taxonomy units
-- Develop native version for Windows, MacOS, and Linux without Java and RockDB dependencies
-
-This project uses **JProfiler**, a powerful profiling tool, for performance analysis and optimization. We thank ej-technologies GmbH for providing an open-source license.
-
-[![JProfiler](https://www.ej-technologies.com/images/product_banners/jprofiler_large.png)](https://www.ej-technologies.com/jprofiler)
-
+- Benchmark and tune DuckDB range join at full TrEMBL scale
+- Add z=2 fragment ions
+- Add decoy generation for FDR estimation
+- Expose `load_ncbi_descendants` as a CLI helper so clade filtering at search
+  time is one extra flag rather than a Python call
+- Downloadable pre-built databases for common taxonomy subsets
