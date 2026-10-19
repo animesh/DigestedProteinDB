@@ -1,54 +1,46 @@
 """
-search_mgf.py – Search an MGF file against the DuckDB peptide database.
+search_mgf.py - Search an MGF against the peptide database.
 
-For each spectrum:
-  1. Compute neutral precursor mass from PEPMASS × CHARGE.
-  2. Query the DB with a ±ppm mass window (unmodified + optional PTM offsets).
-  3. For each candidate peptide: score b/y fragment ions (with PTM
-     localisation when the hit came from a PTM window).
-  4. Filter by minimum matched ions and optional taxid list.
-  5. Write results as TSV.
+Writes PSMs into <db>/meta.duckdb so results accumulate across runs.
+Each run is identified by --run (defaults to MGF filename stem).
 
 Usage:
-    python search_mgf.py \\
-        --db      peptides.duckdb \\
-        --mgf     sample.mgf \\
-        [--ppm    20] \\
-        [--taxid  9606 10090]      # exact NCBI taxids to keep
-        [--ptms]                   # also search PTM offset windows
-        [--min-ions 3]             # min matched fragment ions to report
-        [--names  names.dmp]       # NCBI names.dmp for species labels
-        [--out    results.tsv]
-
-Dependencies:
-    pip install duckdb
+  python search_mgf.py \\
+      --db   combined \\
+      --mgf  sample.mgf \\
+      [--run sample1] \\
+      [--ppm 20] \\
+      [--ptms] \\
+      [--taxid 9606 10090] \\
+      [--min-ions 3] \\
+      [--out  results.tsv]
 """
 
-import argparse
-import sys
+import argparse, sys
 from pathlib import Path
 
 import duckdb
+from rocksdict import Rdict, Options
 
-from common import (
-    PTMS, precursor_neutral, ppm_bounds, ppm_error, score_fragments,
-)
+from common import (PTMS, PROTON, mass_key, key_to_mass, unpack_entries,
+                    precursor_neutral, ppm_bounds, ppm_error, score_fragments,
+                    MASS_INT_SCALE)
 
+# ── RocksDB open ─────────────────────────────────────────────────────────────
 
-# ── MGF parser ────────────────────────────────────────────────────────────────
+def _open_rocks(db_dir):
+    opts = Options(raw_mode=True)
+    opts.create_if_missing(False)
+    return Rdict(str(Path(db_dir) / 'peptides.rocks'), opts)
 
-def parse_mgf(path: str):
-    """
-    Yield spectrum dicts:
-        title, pepmass (float), charge (int), fragments [(mz, intensity)]
-    Silently skips entries without PEPMASS or CHARGE.
-    """
+# ── MGF parser ───────────────────────────────────────────────────────────────
+
+def parse_mgf(path):
     spec, frags = {}, []
     with open(path) as fh:
         for raw in fh:
             line = raw.strip()
-            if not line or line.startswith('#'):
-                continue
+            if not line or line.startswith('#'): continue
             if line == 'BEGIN IONS':
                 spec, frags = {}, []
             elif line == 'END IONS':
@@ -57,203 +49,128 @@ def parse_mgf(path: str):
                     yield spec
             elif '=' in line:
                 k, v = line.split('=', 1)
-                k = k.strip().lower()
-                v = v.strip()
-                if k == 'pepmass':
-                    spec['pepmass'] = float(v.split()[0])
-                elif k == 'charge':
-                    # handles "2+", "2+ 3+", "2"
-                    spec['charge'] = int(v.replace('+', '').split()[0])
-                elif k == 'title':
-                    spec['title'] = v
-                elif k == 'scans':
-                    spec['scans'] = v
+                k = k.strip().lower(); v = v.strip()
+                if k == 'pepmass': spec['pepmass'] = float(v.split()[0])
+                elif k == 'charge': spec['charge'] = int(v.replace('+','').split()[0])
+                elif k == 'title': spec['title'] = v
+                elif k == 'scans': spec['scans'] = v
             else:
                 parts = line.split()
                 if len(parts) >= 2:
-                    try:
-                        frags.append((float(parts[0]), float(parts[1])))
-                    except ValueError:
-                        pass
+                    try: frags.append((float(parts[0]), float(parts[1])))
+                    except ValueError: pass
 
-
-# ── NCBI names ────────────────────────────────────────────────────────────────
-
-def load_ncbi_names(names_dmp: str) -> dict:
-    """taxid (int) -> scientific name (str) from NCBI names.dmp."""
-    names = {}
-    with open(names_dmp) as fh:
-        for line in fh:
-            parts = [p.strip() for p in line.split('|')]
-            if len(parts) >= 4 and parts[3] == 'scientific name':
-                try:
-                    names[int(parts[0])] = parts[1]
-                except ValueError:
-                    pass
-    return names
-
-
-# ── Search ────────────────────────────────────────────────────────────────────
+# ── Search ───────────────────────────────────────────────────────────────────
 
 def search(args):
-    con = duckdb.connect(args.db, read_only=True)
+    db_dir   = Path(args.db)
+    run_name = args.run or Path(args.mgf).stem
 
-    # Optional species name map
-    species_map = {}
-    if args.names:
-        print(f"Loading NCBI names from {args.names} ...", file=sys.stderr)
-        species_map = load_ncbi_names(args.names)
-        print(f"  {len(species_map):,} species loaded.", file=sys.stderr)
+    rocks = _open_rocks(db_dir)
+    meta  = duckdb.connect(str(db_dir / 'meta.duckdb'))
 
-    # Parse MGF
+    # Load species map from accessions for output
+    species_map = dict(meta.execute(
+        "SELECT taxid, species FROM accessions WHERE species != ''").fetchall())
+
     spectra = list(parse_mgf(args.mgf))
     if not spectra:
-        sys.exit("No valid spectra found in MGF.")
-    print(f"Loaded {len(spectra)} spectra from {args.mgf}", file=sys.stderr)
+        print("No valid spectra.", file=sys.stderr); return
+    print(f"Loaded {len(spectra)} spectra.", file=sys.stderr, flush=True)
 
-    # ── Build search-window table ─────────────────────────────────────────────
-    # For each spectrum we create one unmodified window plus one per PTM.
-    # (scan_id, lo_mass_int, hi_mass_int, ptm_label, ptm_mass, ptm_sites)
-    windows = []
+    taxid_set = set(args.taxid) if args.taxid else None
+
+    out_fh = open(args.out, 'w') if args.out else sys.stdout
+    cols = ['scan_id','title','precursor_da','charge','seq',
+            'acc','taxid','species','ppm_err','ptm','ptm_pos',
+            'n_ions','frag_score']
+    print('\t'.join(cols), file=out_fh)
+
+    psm_rows = []
+
     for scan_id, sp in enumerate(spectra):
         neutral = precursor_neutral(sp['pepmass'], sp['charge'])
-
-        lo, hi = ppm_bounds(neutral, args.ppm)
-        windows.append((scan_id, lo, hi, '', 0.0, ''))
-
-        if args.ptms:
-            for label, (delta, sites) in PTMS.items():
-                # The DB stores the bare sequence mass.
-                # Observed neutral = seq_mass + delta  =>  seq_mass = neutral - delta
-                seq_mass = neutral - delta
-                if seq_mass < 600:
-                    continue
-                lo2, hi2 = ppm_bounds(seq_mass, args.ppm)
-                windows.append((scan_id, lo2, hi2, label, delta, sites or ''))
-
-    # ── Single range join across all spectra ──────────────────────────────────
-    con.execute("""
-        CREATE TEMP TABLE _q (
-            scan_id   INTEGER,
-            lo        INTEGER,
-            hi        INTEGER,
-            ptm_label TEXT,
-            ptm_mass  DOUBLE,
-            ptm_sites TEXT
-        )
-    """)
-    con.executemany("INSERT INTO _q VALUES (?, ?, ?, ?, ?, ?)", windows)
-
-    taxid_clause = ""
-    if args.taxid:
-        taxids_str = ','.join(str(t) for t in args.taxid)
-        taxid_clause = f"AND p.taxid IN ({taxids_str})"
-
-    sql = f"""
-        SELECT
-            q.scan_id,
-            q.ptm_label,
-            q.ptm_mass,
-            q.ptm_sites,
-            p.mass_int,
-            p.seq,
-            p.acc,
-            p.taxid
-        FROM _q q
-        JOIN peptides p
-          ON p.mass_int >= q.lo AND p.mass_int <= q.hi
-        WHERE 1=1 {taxid_clause}
-        ORDER BY q.scan_id, p.mass_int
-    """
-    hits = con.execute(sql).fetchall()
-    con.close()
-
-    print(f"Candidate hits before fragment scoring: {len(hits):,}",
-          file=sys.stderr)
-
-    # ── Score and write results ───────────────────────────────────────────────
-    out_fh = open(args.out, 'w') if args.out else sys.stdout
-
-    header = [
-        'scan_id', 'title', 'precursor_mass_da', 'charge',
-        'peptide_seq', 'accession', 'taxid', 'species',
-        'ppm_err', 'ptm', 'ptm_pos', 'n_matched_ions', 'frag_score',
-    ]
-    print('\t'.join(header), file=out_fh)
-
-    reported = 0
-    for (scan_id, ptm_label, ptm_mass, ptm_sites,
-         mass_int, seq, acc, taxid) in hits:
-
-        sp = spectra[scan_id]
-        neutral    = precursor_neutral(sp['pepmass'], sp['charge'])
-        seq_mass   = mass_int / 1e4         # unmodified sequence mass from DB
-        ppm_err    = ppm_error(neutral - ptm_mass, seq_mass)
-
-        frags = sp.get('fragments', [])
-        n_ions, frag_score, ptm_pos = score_fragments(
-            seq, frags, args.ppm, ptm_mass, ptm_sites)
-
-        if frags and n_ions < args.min_ions:
-            continue
-
-        species = species_map.get(taxid, '')
+        frags   = sp.get('fragments', [])
         title   = sp.get('title', sp.get('scans', str(scan_id)))
 
-        row = [
-            str(scan_id),
-            title,
-            f"{neutral:.5f}",
-            str(sp['charge']),
-            seq,
-            acc,
-            str(taxid),
-            species,
-            f"{ppm_err:.2f}",
-            ptm_label or 'none',
-            str(ptm_pos),           # -1 = no PTM or not localised
-            str(n_ions),
-            f"{frag_score:.4f}",
-        ]
-        print('\t'.join(row), file=out_fh)
-        reported += 1
+        # Build search windows: unmodified + optional PTM offsets
+        windows = [(neutral, 0.0, '')]
+        if args.ptms:
+            for label, (delta, sites) in PTMS.items():
+                seq_mass = neutral - delta
+                if seq_mass >= 600:
+                    windows.append((seq_mass, delta, label))
 
-    if args.out:
-        out_fh.close()
-        print(f"Results written to {args.out}  ({reported:,} rows)",
+        seen = set()
+        for seq_mass, ptm_delta, ptm_label in windows:
+            lo, hi = ppm_bounds(seq_mass, args.ppm)
+
+            hi_key = mass_key(hi)
+            for k, v in rocks.items(from_key=mass_key(lo)):
+                if k > hi_key: break
+                mi = key_to_mass(k)
+                for seq, acc, taxid in unpack_entries(v):
+                    if taxid_set and taxid not in taxid_set:
+                        continue
+                    uid = (seq, acc, ptm_label)
+                    if uid in seen: continue
+                    seen.add(uid)
+
+                    ppm  = ppm_error(seq_mass, mi / MASS_INT_SCALE)
+                    ptm_sites = PTMS[ptm_label][1] if ptm_label else ''
+                    n_ions, frag_score, ptm_pos = score_fragments(
+                        seq, frags, args.ppm, ptm_delta, ptm_sites)
+
+                    if frags and n_ions < args.min_ions:
+                        continue
+
+                    species = species_map.get(taxid, '')
+                    row = [str(scan_id), title,
+                           f"{neutral:.5f}", str(sp['charge']),
+                           seq, acc, str(taxid), species,
+                           f"{ppm:.2f}", ptm_label or 'none',
+                           str(ptm_pos), str(n_ions),
+                           f"{frag_score:.4f}"]
+                    print('\t'.join(row), file=out_fh)
+
+                    psm_rows.append((run_name, scan_id, title,
+                                     neutral, sp['charge'],
+                                     seq, acc, taxid,
+                                     ppm, ptm_label or 'none', ptm_pos,
+                                     n_ions, frag_score))
+
+    rocks.close()
+    if args.out: out_fh.close()
+
+    # Persist PSMs
+    if psm_rows:
+        meta.executemany("""
+            INSERT INTO psms
+            (run,scan_id,title,precursor_da,charge,seq,acc,taxid,
+             ppm_err,ptm,ptm_pos,n_ions,frag_score)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, psm_rows)
+        meta.commit()
+        print(f"Stored {len(psm_rows)} PSMs → {db_dir}/meta.duckdb  run='{run_name}'",
               file=sys.stderr)
-    else:
-        print(f"{reported:,} results written to stdout", file=sys.stderr)
 
+    meta.close()
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser(
-        description='Search MGF against a DuckDB peptide database')
-    p.add_argument('--db',       required=True,
-                   help='DuckDB file produced by build_db.py')
-    p.add_argument('--mgf',      required=True,
-                   help='Input MGF file')
-    p.add_argument('--ppm',      type=float, default=20.0,
-                   help='Mass tolerance in ppm (default 20)')
-    p.add_argument('--taxid',    type=int, nargs='+',
-                   help='Keep only these NCBI taxids '
-                        '(pass all descendants if filtering a clade)')
-    p.add_argument('--ptms',     action='store_true',
-                   help='Also search with common PTM offsets '
-                        '(oxidation, phospho, deamidation, …)')
-    p.add_argument('--min-ions', type=int, default=3,
-                   help='Min matched fragment ions to report a hit '
-                        '(only applied when MS2 fragments are present; default 3)')
-    p.add_argument('--names',    default=None,
-                   help='NCBI names.dmp for species name column '
-                        '(download from ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz)')
-    p.add_argument('--out',      default=None,
-                   help='Output TSV path (default: stdout)')
+    p = argparse.ArgumentParser(description='Search MGF against peptide DB')
+    p.add_argument('--db',       required=True)
+    p.add_argument('--mgf',      required=True)
+    p.add_argument('--run',      default=None,
+                   help='Run label stored in PSMs table (default: MGF stem)')
+    p.add_argument('--ppm',      type=float, default=20.0)
+    p.add_argument('--taxid',    type=int, nargs='+')
+    p.add_argument('--ptms',     action='store_true')
+    p.add_argument('--min-ions', type=int, default=3)
+    p.add_argument('--out',      default=None)
     args = p.parse_args()
     search(args)
-
 
 if __name__ == '__main__':
     main()

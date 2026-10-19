@@ -23,7 +23,7 @@ The database is a plain DuckDB file with two tables:
 ## Install
 
 ```bash
-pip install duckdb pyarrow lxml
+pip install duckdb pyarrow
 ```
 
 Python 3.10+ required. No other dependencies.
@@ -33,10 +33,9 @@ Python 3.10+ required. No other dependencies.
 ```bash
 python build_db.py ^
     --fasta L:\promec\FastaDB\uniprot_trembl.fasta ^
-    --db C:\Users\animeshs\tmp\combined.duckdb ^
-    --tmp-dir C:\Users\animeshs\tmp ^
-    --memory 28GB --threads 12 --bands 20 ^
-    --log build.log --merge-only
+    --db C:\Users\animeshs\tmp\trembl ^
+    --workers 12  ^
+    --log build.rocks.log
 # TrEMBL bacteria only (~50 GB on disk, a few hours)
 python build_db.py \
     --uniprot uniprot_trembl.xml.gz \
