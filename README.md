@@ -34,8 +34,7 @@ Python 3.10+ required. No other dependencies.
 python build_db.py ^
     --fasta L:\promec\FastaDB\uniprot_trembl.fasta ^
     --db C:\Users\animeshs\tmp\trembl ^
-    --workers 12  ^
-    --log build.rocks.log
+    --workers 12  
 # TrEMBL bacteria only (~50 GB on disk, a few hours)
 python build_db.py \
     --uniprot uniprot_trembl.xml.gz \
@@ -71,18 +70,10 @@ Memory during build stays constant regardless of input size: proteins are stream
 one at a time, peptide rows are written in Parquet chunks of 5 M rows, and
 DuckDB does the final merge-sort in one parallel pass.
 
-## Search an MGF file
+## Search 
 
 ```bash
-python search_mgf.py \
-    --db      trembl_bacteria.duckdb \
-    --mgf     sample.mgf \
-    --ppm     20 \
-    --ptms \
-    --taxid   1763 1760 \
-    --names   names.dmp \
-    --min-ions 3 \
-    --out     results.tsv
+python query.py --db C:\Users\animeshs\tmp\trembl --mass 1500.6 --ppm 20
 ```
 
 ### Search parameters

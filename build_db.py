@@ -1,27 +1,24 @@
 """
 build_db.py - Build a peptide database from UniProt FASTA.
 
-Output: <db>/ directory containing
-  peptides.rocks/   RocksDB: 4-byte big-endian mass_int → packed (seq,acc,taxid)
-  meta.duckdb       accessions (acc, taxid, species) + empty psms table
+Design:
+  1. Workers digest proteins and write peptides directly to
+     mass-band Parquet files (band = mass range bucket).
+  2. After digestion, each band is sorted in-memory with PyArrow.
+     Each band is ~1 GB so it always fits in RAM. No temp disk.
+  3. DuckDB VIEW over sorted band files for fast range queries.
+     PSMs and accessions go in meta.duckdb.
 
-Workers use only Python stdlib (no rocksdict, no Rust).  Each worker
-writes sorted binary chunks: [4B mass_int BE][4B blob_len BE][blob].
-The main process does a k-way merge of all chunks into the final RocksDB.
+No RocksDB. No Rust. No global sort. Dependencies: duckdb pyarrow.
 
 Usage:
-  python build_db.py \\
-      --fasta  uniprot_sprot.fasta uniprot_trembl.fasta \\
-      --db     C:\\proteomics\\combined \\
-      [--tmp   C:\\tmp] [--workers 12] \\
-      [--enzyme trypsin] [--min 7] [--max 30] [--mc 1] \\
-      [--taxid 2] [--nodes nodes.dmp] [--names names.dmp] \\
-      [--log   build.log]
-
-  pip install rocksdict duckdb pyarrow
+  python build_db.py ^
+      --fasta uniprot_trembl.fasta ^
+      --db    C:\\tmp\\trembl ^
+      [--workers 12] [--taxid 2] [--nodes nodes.dmp] [--names names.dmp]
 """
 
-import argparse, gzip, heapq, os, re, shutil, struct, sys, traceback
+import argparse, gzip, os, re, shutil, sys, traceback
 from collections import defaultdict, deque
 from datetime import datetime
 from multiprocessing import Pool, cpu_count
@@ -30,47 +27,36 @@ from pathlib import Path
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pyarrow.compute as pc
 
-from common import (digest, neutral_mass, pack_entry, mass_key, MASS_INT_SCALE)
+from common import digest, neutral_mass, pack_entry, MASS_INT_SCALE
+
+# ── Mass band config ──────────────────────────────────────────────────────────
+MASS_LO   = 4_000_000      # 400 Da × 1e4
+MASS_HI   = 50_000_000     # 5000 Da × 1e4
+N_BANDS   = 20
+BAND_W    = (MASS_HI - MASS_LO) // N_BANDS
+BAND_FLUSH = 100_000        # rows per band buffer; keep per-worker RAM low
+
+def _band(mi: int) -> int:
+    return max(0, min(N_BANDS - 1, (mi - MASS_LO) // BAND_W))
+
+# ── Schemas ───────────────────────────────────────────────────────────────────
+_PEP_SCHEMA = pa.schema([
+    ('mass_int', pa.int32()), ('seq', pa.string()),
+    ('acc',      pa.string()), ('taxid', pa.int32()),
+])
+_ACC_SCHEMA = pa.schema([('acc', pa.string()), ('taxid', pa.int32())])
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-
 _log_fh = None
-
 def log(msg):
     ts = datetime.now().strftime('%H:%M:%S')
     line = f"[{ts}] {msg}"
     print(line, file=sys.stderr, flush=True)
-    if _log_fh:
-        print(line, file=_log_fh, flush=True)
-
-# ── Binary chunk I/O ──────────────────────────────────────────────────────────
-# Format: [mass_int: 4B BE][blob_len: 4B BE][blob: blob_len B]  (sorted by mass_int)
-
-_HDR = struct.Struct('>II')   # big-endian unsigned int, unsigned int
-
-def _write_chunk(path: str, buf: dict):
-    """Write sorted {mass_int_int: bytearray} to a binary chunk file."""
-    with open(path, 'wb') as f:
-        for mi in sorted(buf):
-            blob = bytes(buf[mi])
-            f.write(_HDR.pack(mi, len(blob)))
-            f.write(blob)
-
-def _iter_chunk(path: str):
-    """Yield (mass_key_bytes, blob_bytes) from a sorted binary chunk."""
-    hdr_size = _HDR.size
-    with open(path, 'rb') as f:
-        while True:
-            hdr = f.read(hdr_size)
-            if len(hdr) < hdr_size:
-                break
-            mi, blen = _HDR.unpack(hdr)
-            blob = f.read(blen)
-            yield mass_key(mi), blob
+    if _log_fh: print(line, file=_log_fh, flush=True)
 
 # ── FASTA parsing ─────────────────────────────────────────────────────────────
-
 _OX_RE = re.compile(r'OX=(\d+)')
 
 def _parse_header(line):
@@ -84,8 +70,7 @@ def _iter_fasta_range(path, start, end):
     with open(path, 'r', encoding='ascii', errors='ignore') as fh:
         fh.seek(start)
         while True:
-            line_pos = fh.tell()
-            line = fh.readline()
+            lp = fh.tell(); line = fh.readline()
             if not line:
                 if acc and parts: yield acc, taxid, ''.join(parts)
                 break
@@ -93,310 +78,269 @@ def _iter_fasta_range(path, start, end):
             if not line: continue
             if line.startswith('>'):
                 if acc and parts: yield acc, taxid, ''.join(parts)
-                if line_pos >= end: break
-                acc, taxid = _parse_header(line[1:])
-                parts = []
+                if lp >= end: break
+                acc, taxid = _parse_header(line[1:]); parts = []
             elif acc is not None:
                 parts.append(line.upper())
 
 def _iter_fasta_gz(path):
-    open_fn = gzip.open if path.endswith('.gz') else open
+    fn = gzip.open if path.endswith('.gz') else open
     acc, taxid, parts = None, 0, []
-    with open_fn(path, 'rt', encoding='ascii', errors='ignore') as fh:
+    with fn(path, 'rt', encoding='ascii', errors='ignore') as fh:
         for line in fh:
             line = line.rstrip()
             if not line: continue
             if line.startswith('>'):
                 if acc and parts: yield acc, taxid, ''.join(parts)
-                acc, taxid = _parse_header(line[1:])
-                parts = []
-            elif acc is not None:
-                parts.append(line.upper())
+                acc, taxid = _parse_header(line[1:]); parts = []
+            elif acc is not None: parts.append(line.upper())
     if acc and parts: yield acc, taxid, ''.join(parts)
 
-def _find_chunk_boundaries(path, n):
-    size = os.path.getsize(path)
-    boundaries = [0]
+def _chunk_boundaries(path, n):
+    size = os.path.getsize(path); bounds = [0]
     with open(path, 'rb') as fh:
         for i in range(1, n):
-            target = (size * i) // n
-            fh.seek(max(0, target - 1))
-            buf = fh.read(1 << 20)
-            idx = buf.find(b'\n>')
-            boundaries.append((max(0, target-1)+idx+1) if idx >= 0 else size)
-    boundaries.append(size)
-    return boundaries
+            t = (size * i) // n; fh.seek(max(0, t-1))
+            buf = fh.read(1 << 20); idx = buf.find(b'\n>')
+            bounds.append((max(0,t-1)+idx+1) if idx >= 0 else size)
+    bounds.append(size); return bounds
 
-# ── NCBI taxonomy ─────────────────────────────────────────────────────────────
-
-def load_ncbi_descendants(nodes_dmp, parent_taxids):
-    log("Loading taxonomy ...")
-    children = defaultdict(list)
+# ── NCBI helpers ──────────────────────────────────────────────────────────────
+def _descendants(nodes_dmp, parents):
+    log("Loading taxonomy ..."); ch = defaultdict(list)
     with open(nodes_dmp) as fh:
         for line in fh:
-            parts = line.split('|')
-            if len(parts) < 2: continue
-            try: children[int(parts[1].strip())].append(int(parts[0].strip()))
+            p = line.split('|')
+            if len(p) < 2: continue
+            try: ch[int(p[1].strip())].append(int(p[0].strip()))
             except ValueError: pass
-    allowed, q = set(), deque(parent_taxids)
+    allowed, q = set(), deque(parents)
     while q:
         t = q.popleft()
         if t in allowed: continue
-        allowed.add(t); q.extend(children.get(t, []))
-    log(f"  {len(allowed):,} allowed taxids.")
-    return allowed
+        allowed.add(t); q.extend(ch.get(t, []))
+    log(f"  {len(allowed):,} allowed taxids."); return allowed
 
-def load_ncbi_names(names_dmp):
-    log("Loading species names ...")
-    names = {}
+def _names(names_dmp):
+    log("Loading species names ..."); names = {}
     with open(names_dmp) as fh:
         for line in fh:
-            parts = [p.strip() for p in line.split('|')]
-            if len(parts) >= 4 and parts[3] == 'scientific name':
-                try: names[int(parts[0])] = parts[1]
+            p = [x.strip() for x in line.split('|')]
+            if len(p) >= 4 and p[3] == 'scientific name':
+                try: names[int(p[0])] = p[1]
                 except ValueError: pass
-    log(f"  {len(names):,} names loaded.")
-    return names
+    log(f"  {len(names):,} names."); return names
 
-# ── Worker (no rocksdict - stdlib only) ───────────────────────────────────────
-
-FLUSH_KEYS = 500_000   # unique mass_int keys per binary chunk
+# ── Worker (pure Python + pyarrow, no Rust) ───────────────────────────────────
+def _flush_band(b, bufs, bchk, tmp_dir, worker_id):
+    ms, seqs, accs, tids = bufs[b]
+    if not ms: return
+    pq.write_table(
+        pa.table({'mass_int': pa.array(ms, pa.int32()),
+                  'seq':      pa.array(seqs, pa.string()),
+                  'acc':      pa.array(accs, pa.string()),
+                  'taxid':    pa.array(tids, pa.int32())},
+                 schema=_PEP_SCHEMA),
+        str(Path(tmp_dir) / f'wband_{b:03d}_{worker_id:04d}_{bchk[b]:05d}.parquet'),
+        compression='zstd', write_statistics=True)
+    bufs[b] = ([], [], [], []); bchk[b] += 1
 
 def _worker_fn(args):
-    """
-    Digest proteins and write sorted binary chunk files.
-    No rocksdict here: avoids Rust/spawn crash on Windows.
-    """
-    (path, start, end, allowed_taxids,
-     min_len, max_len, mc, enzyme, tmp_dir, worker_id) = args
-
-    buf = {}        # mass_int (int) → bytearray of packed entries
-    aacc, atid = [], []
-    n_prot = n_pep = chunk_id = 0
-
-    def flush():
-        nonlocal chunk_id
-        out = str(Path(tmp_dir) / f'w{worker_id:04d}_{chunk_id:05d}.bin')
-        _write_chunk(out, buf)
-        buf.clear()
-        chunk_id += 1
-
+    path, start, end, allowed, min_l, max_l, mc, enzyme, tmp_dir, wid = args
+    bufs = [([], [], [], []) for _ in range(N_BANDS)]
+    bchk = [0] * N_BANDS; aacc = []; atid = []; n_prot = n_pep = 0
     for acc, taxid, seq in _iter_fasta_range(path, start, end):
-        if allowed_taxids is not None and taxid not in allowed_taxids:
-            continue
+        if allowed is not None and taxid not in allowed: continue
         aacc.append(acc); atid.append(taxid)
-        peps = digest(seq, min_len, max_len, mc, enzyme)
+        peps = digest(seq, min_l, max_l, mc, enzyme)
         for pep in peps:
             mi = round(neutral_mass(pep) * MASS_INT_SCALE)
-            entry = pack_entry(pep, acc, taxid)
-            if mi in buf: buf[mi] += entry
-            else: buf[mi] = bytearray(entry)
+            b = _band(mi); ms, seqs, accs, tids = bufs[b]
+            ms.append(mi); seqs.append(pep)
+            accs.append(acc); tids.append(taxid)
         n_prot += 1; n_pep += len(peps)
-        if len(buf) >= FLUSH_KEYS:
-            flush()
-
-    if buf:
-        flush()
-
+        for b in range(N_BANDS):
+            if len(bufs[b][0]) >= BAND_FLUSH:
+                _flush_band(b, bufs, bchk, tmp_dir, wid)
+    for b in range(N_BANDS): _flush_band(b, bufs, bchk, tmp_dir, wid)
     pq.write_table(
-        pa.table({'acc': pa.array(aacc), 'taxid': pa.array(atid, pa.int32())}),
-        str(Path(tmp_dir) / f'acc_{worker_id:04d}.parquet'),
-        compression='zstd')
+        pa.table({'acc': pa.array(aacc), 'taxid': pa.array(atid, pa.int32())},
+                 schema=_ACC_SCHEMA),
+        str(Path(tmp_dir) / f'acc_{wid:04d}.parquet'), compression='zstd')
+    return wid, n_prot, n_pep
 
-    return worker_id, n_prot, n_pep, chunk_id
+# ── In-memory band sort (PyArrow) ─────────────────────────────────────────────
+_LARGE_SCHEMA = pa.schema([
+    pa.field('mass_int', pa.int32()),
+    pa.field('seq',      pa.large_string()),
+    pa.field('acc',      pa.large_string()),
+    pa.field('taxid',    pa.int32()),
+])
 
-# ── K-way merge into RocksDB (main process only) ─────────────────────────────
+# PyArrow sort needs ~3x data size in RAM (input + indices + output).
+# At 36 GB machine with 8 GB OS overhead: safe up to ~9 GB = ~270M rows.
+_PYARROW_ROW_LIMIT = 250_000_000
 
-def _kway_merge_to_rocks(chunk_files, rocks_path):
+
+def _sort_bands(tmp_dir: Path, data_dir: Path, memory: str = '28GB') -> str:
     """
-    K-way merge of sorted binary chunk files into a single RocksDB.
-    rocksdict is imported here, in the main process only.
+    Sort each band's files.
+    Small bands (≤250M rows): PyArrow in-memory – fastest.
+    Large bands (>250M rows): DuckDB COPY ORDER BY – memory-efficient,
+      spills to tmp_dir if needed, never crashes.
     """
-    from rocksdict import Rdict, Options, WriteBatch, DBCompressionType
+    data_dir.mkdir(exist_ok=True)
+    for b in range(N_BANDS):
+        files = sorted(tmp_dir.glob(f'wband_{b:03d}_*.parquet'))
+        if not files:
+            continue
+        total_rows = sum(pq.read_metadata(str(f)).num_rows for f in files)
+        out = str(data_dir / f'peptides_{b:05d}.parquet')
+        log(f"  Band {b+1}/{N_BANDS}: {len(files)} file(s), {total_rows:,} rows ...")
 
-    opts = Options(raw_mode=True)
-    opts.create_if_missing(True)
-    opts.set_compression_type(DBCompressionType.lz4())
-    opts.set_write_buffer_size(256 << 20)
-    out = Rdict(str(rocks_path), opts)
-
-    iters = [_iter_chunk(p) for p in chunk_files]
-    heap  = []
-    for i, it in enumerate(iters):
-        try:
-            k, v = next(it)
-            heapq.heappush(heap, (k, i, v))
-        except StopIteration:
-            pass
-
-    cur_key, cur_val = None, b''
-    batch = WriteBatch(raw_mode=True)
-    n_keys = 0
-
-    while heap:
-        k, i, v = heapq.heappop(heap)
-        if k == cur_key:
-            cur_val += v
+        if total_rows <= _PYARROW_ROW_LIMIT:
+            # In-memory PyArrow sort
+            table = pq.read_table([str(f) for f in files], schema=_PEP_SCHEMA)
+            table = table.cast(_LARGE_SCHEMA)
+            idx   = pc.sort_indices(table, sort_keys=[('mass_int', 'ascending')])
+            pq.write_table(table.take(idx), out,
+                           compression='zstd', row_group_size=500_000,
+                           write_statistics=True)
         else:
-            if cur_key is not None:
-                batch.put(cur_key, cur_val)
-                n_keys += 1
-                if n_keys % 1_000_000 == 0:
-                    out.write(batch)
-                    batch = WriteBatch(raw_mode=True)
-                    log(f"  Merged {n_keys:,} unique masses ...")
-            cur_key, cur_val = k, v
-        try:
-            nk, nv = next(iters[i])
-            heapq.heappush(heap, (nk, i, nv))
-        except StopIteration:
-            pass
+            # DuckDB sort: memory-efficient, spills to tmp_dir if needed
+            file_list = ', '.join(f"'{f}'" for f in files)
+            ddb_tmp   = str(tmp_dir / 'ddb_tmp').replace('\\', '/')
+            con = duckdb.connect()
+            con.execute(f"SET memory_limit='{memory}'")
+            con.execute(f"SET temp_directory='{ddb_tmp}'")
+            con.execute("SET preserve_insertion_order=false")
+            con.execute(f"""
+                COPY (SELECT * FROM read_parquet([{file_list}]) ORDER BY mass_int)
+                TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
+            """)
+            con.close()
 
-    if cur_key:
-        batch.put(cur_key, cur_val)
-        n_keys += 1
-    out.write(batch)
-    out.close()
-    return n_keys
+        for f in files:
+            f.unlink()
+
+    return str(data_dir / 'peptides_*.parquet').replace('\\', '/')
 
 # ── Build ─────────────────────────────────────────────────────────────────────
-
 def build(args):
-    db_dir     = Path(args.db)
-    db_dir.mkdir(parents=True, exist_ok=True)
-    rocks_path = db_dir / 'peptides.rocks'
-    meta_path  = db_dir / 'meta.duckdb'
-    tmp_root   = Path(args.tmp) if args.tmp else db_dir.parent
-    tmp_dir    = tmp_root / (db_dir.name + '_build_tmp')
+    db_dir  = Path(args.db); db_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = db_dir / 'peptides_data'
+    meta_p  = db_dir / 'meta.duckdb'
+    tmp_dir = (Path(args.tmp) if args.tmp else db_dir.parent) / (db_dir.name + '_tmp')
+    log(f"DB  : {db_dir}"); log(f"Tmp : {tmp_dir}")
 
-    log(f"DB        : {db_dir}")
-    log(f"Temp      : {tmp_dir}")
-
-    if tmp_dir.exists():
-        log("Removing stale temp dir ...")
-        shutil.rmtree(tmp_dir)
+    if tmp_dir.exists(): shutil.rmtree(tmp_dir)
     tmp_dir.mkdir()
 
-    allowed_taxids = None
-    if args.taxid:
-        if not args.nodes:
-            log("ERROR: --nodes required with --taxid"); sys.exit(1)
-        allowed_taxids = load_ncbi_descendants(args.nodes, args.taxid)
+    allowed = _descendants(args.nodes, args.taxid) if args.taxid else None
+    if args.taxid and not args.nodes:
+        log("ERROR: --nodes required with --taxid"); sys.exit(1)
 
     abs_paths = [str(Path(p).resolve()) for p in args.fasta]
     all_gz    = all(p.endswith('.gz') for p in abs_paths)
-    n_workers = args.workers or max(1, cpu_count())
+    nw        = args.workers or max(1, cpu_count())
 
-    # ── Digestion ─────────────────────────────────────────────────────────────
-    if all_gz or n_workers == 1:
+    # ── digestion ─────────────────────────────────────────────────────────────
+    if all_gz or nw == 1:
         log("Workers: 1 (serial)")
-        buf = {}; aacc, atid = [], []; n_prot = n_pep = chunk_id = 0
-
-        def serial_flush():
-            nonlocal chunk_id
-            _write_chunk(str(tmp_dir / f'w0000_{chunk_id:05d}.bin'), buf)
-            buf.clear(); chunk_id += 1  # noqa: E702
-
+        bufs = [([], [], [], []) for _ in range(N_BANDS)]
+        bchk = [0] * N_BANDS; aacc = []; atid = []; np = npe = 0
         for path in abs_paths:
             log(f"Parsing {path} ...")
             for acc, taxid, seq in _iter_fasta_gz(path):
-                if allowed_taxids and taxid not in allowed_taxids: continue
+                if allowed and taxid not in allowed: continue
                 aacc.append(acc); atid.append(taxid)
                 peps = digest(seq, args.min, args.max, args.mc, args.enzyme)
                 for pep in peps:
-                    mi = round(neutral_mass(pep) * MASS_INT_SCALE)
-                    entry = pack_entry(pep, acc, taxid)
-                    if mi in buf: buf[mi] += entry
-                    else: buf[mi] = bytearray(entry)
-                n_prot += 1; n_pep += len(peps)
-                if n_prot % 100_000 == 0:
-                    log(f"  {n_prot:,} proteins | {n_pep:,} peptides")
-                if len(buf) >= FLUSH_KEYS:
-                    serial_flush()
-        if buf: serial_flush()
+                    mi = round(neutral_mass(pep) * MASS_INT_SCALE); b = _band(mi)
+                    ms, seqs, accs, tids = bufs[b]
+                    ms.append(mi); seqs.append(pep); accs.append(acc); tids.append(taxid)
+                np += 1; npe += len(peps)
+                if np % 100_000 == 0: log(f"  {np:,} proteins | {npe:,} peptides")
+                for b in range(N_BANDS):
+                    if len(bufs[b][0]) >= BAND_FLUSH:
+                        _flush_band(b, bufs, bchk, tmp_dir, 0)
+        for b in range(N_BANDS): _flush_band(b, bufs, bchk, tmp_dir, 0)
         pq.write_table(
-            pa.table({'acc': pa.array(aacc), 'taxid': pa.array(atid, pa.int32())}),
+            pa.table({'acc': pa.array(aacc), 'taxid': pa.array(atid, pa.int32())},
+                     schema=_ACC_SCHEMA),
             str(tmp_dir / 'acc_0000.parquet'), compression='zstd')
-        total_prot, total_pep = n_prot, n_pep
+        total_p, total_pe = np, npe
     else:
-        log(f"Workers: {n_workers} (parallel byte-range)")
+        log(f"Workers: {nw} (parallel)")
         jobs = []
         for path in abs_paths:
             log(f"  Splitting {path} ...")
-            bounds = _find_chunk_boundaries(path, n_workers)
+            bounds = _chunk_boundaries(path, nw)
             for s, e in zip(bounds, bounds[1:]):
-                wid = len(jobs)
-                jobs.append((path, s, e, allowed_taxids,
+                jobs.append((path, s, e, allowed,
                              args.min, args.max, args.mc, args.enzyme,
-                             str(tmp_dir), wid))
-        total_prot = total_pep = 0
+                             str(tmp_dir), len(jobs)))
+        total_p = total_pe = 0
         try:
-            with Pool(n_workers) as pool:
-                for wid, np, npe, nc in pool.imap_unordered(
-                        _worker_fn, jobs, chunksize=1):
-                    total_prot += np; total_pep += npe
-                    log(f"  Worker {wid:3d}: {np:,} proteins | {npe:,} peptides"
-                        f" | {nc} chunk(s)")
-        except KeyboardInterrupt:
-            log("Interrupted."); sys.exit(1)
+            with Pool(nw) as pool:
+                for wid, np, npe in pool.imap_unordered(_worker_fn, jobs, chunksize=1):
+                    total_p += np; total_pe += npe
+                    log(f"  Worker {wid:3d}: {np:,} proteins | {npe:,} peptides")
+        except KeyboardInterrupt: log("Interrupted."); sys.exit(1)
         except Exception:
             log("ERROR:"); log(traceback.format_exc())
-            log("Temp kept: " + str(tmp_dir)); sys.exit(1)
+            log(f"Temp kept: {tmp_dir}"); sys.exit(1)
 
-    log(f"Digestion done. {total_prot:,} proteins | {total_pep:,} peptides")
+    log(f"Digestion done. {total_p:,} proteins | {total_pe:,} peptides")
 
-    # ── K-way merge ───────────────────────────────────────────────────────────
-    chunk_files = sorted(str(p) for p in tmp_dir.glob('w*.bin'))
-    log(f"K-way merging {len(chunk_files)} sorted chunks into RocksDB ...")
-    if rocks_path.exists():
-        shutil.rmtree(str(rocks_path))
+    # ── sort ──────────────────────────────────────────────────────────────────
+    log("Sorting bands in-memory (PyArrow) ...")
+    if data_dir.exists(): shutil.rmtree(data_dir)
     try:
-        n_keys = _kway_merge_to_rocks(chunk_files, rocks_path)
+        data_glob = _sort_bands(tmp_dir, data_dir)
     except Exception:
-        log("ERROR:"); log(traceback.format_exc())
-        log("Temp kept: " + str(tmp_dir)); sys.exit(1)
-    log(f"  {n_keys:,} unique mass keys.")
+        log("ERROR:"); log(traceback.format_exc()); log(f"Temp: {tmp_dir}"); sys.exit(1)
 
     # ── meta.duckdb ───────────────────────────────────────────────────────────
     log("Building meta.duckdb ...")
-    species_map = load_ncbi_names(args.names) if args.names else {}
-    if meta_path.exists():
-        meta_path.unlink()
-    con = duckdb.connect(str(meta_path))
+    smap = _names(args.names) if args.names else {}
+    if meta_p.exists(): meta_p.unlink()
+    con = duckdb.connect(str(meta_p))
     acc_glob = str(tmp_dir / 'acc_*.parquet').replace('\\', '/')
     con.execute(f"""
         CREATE TABLE accessions AS
         SELECT acc, MAX(taxid) AS taxid, '' AS species
-        FROM read_parquet('{acc_glob}') GROUP BY acc
-    """)
-    if species_map:
-        for taxid, name in species_map.items():
-            con.execute("UPDATE accessions SET species=? WHERE taxid=?", [name, taxid])
+        FROM read_parquet('{acc_glob}') GROUP BY acc""")
+    if smap:
+        for tid, name in smap.items():
+            con.execute("UPDATE accessions SET species=? WHERE taxid=?", [name, tid])
     con.execute("CREATE INDEX acc_idx ON accessions(acc)")
     n_acc = con.execute("SELECT COUNT(*) FROM accessions").fetchone()[0]
     log(f"  accessions: {n_acc:,}")
-    con.execute("""
-        CREATE TABLE psms (
-            run TEXT, scan_id INTEGER, title TEXT,
-            precursor_da DOUBLE, charge INTEGER,
-            seq TEXT, acc TEXT, taxid INTEGER,
-            ppm_err DOUBLE, ptm TEXT, ptm_pos INTEGER,
-            n_ions INTEGER, frag_score DOUBLE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+
+    dg = str(data_dir / 'peptides_*.parquet').replace('\\', '/')
+    con.execute(f"CREATE VIEW peptides AS SELECT * FROM read_parquet('{dg}')")
+    n_pep = con.execute("SELECT COUNT(*) FROM peptides").fetchone()[0]
+    log(f"  peptides:   {n_pep:,}")
+
+    con.execute("""CREATE TABLE psms (
+        run TEXT, scan_id INTEGER, title TEXT,
+        precursor_da DOUBLE, charge INTEGER,
+        seq TEXT, acc TEXT, taxid INTEGER,
+        ppm_err DOUBLE, ptm TEXT, ptm_pos INTEGER,
+        n_ions INTEGER, frag_score DOUBLE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
     con.close()
 
     shutil.rmtree(tmp_dir)
     log(f"\nDone.  {db_dir}/")
-    log(f"  unique masses : {n_keys:,}")
-    log(f"  accessions    : {n_acc:,}")
+    log(f"  peptides    : {n_pep:,}")
+    log(f"  accessions  : {n_acc:,}")
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
-
 def main():
     global _log_fh
-    p = argparse.ArgumentParser(description='Build peptide DB from UniProt FASTA')
+    p = argparse.ArgumentParser()
     p.add_argument('--fasta',   required=True, nargs='+')
     p.add_argument('--db',      required=True)
     p.add_argument('--tmp',     default=None)
@@ -410,11 +354,8 @@ def main():
     p.add_argument('--names',   default=None)
     p.add_argument('--log',     default=None)
     args = p.parse_args()
-    if args.log:
-        _log_fh = open(args.log, 'w', buffering=1)
-    log("build_db.py starting")
-    log(f"  fasta  : {args.fasta}")
-    log(f"  db     : {args.db}")
+    if args.log: _log_fh = open(args.log, 'w', buffering=1)
+    log("build_db.py"); log(f"  fasta: {args.fasta}"); log(f"  db: {args.db}")
     build(args)
     if _log_fh: _log_fh.close()
 
